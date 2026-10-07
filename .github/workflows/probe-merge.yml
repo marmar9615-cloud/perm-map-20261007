@@ -1,0 +1,47 @@
+name: probe-merge
+on: workflow_dispatch
+env:
+  R: marmar9615-cloud/perm-map-20261007
+jobs:
+  low:
+    # Lower-authority principal: GITHUB_TOKEN with contents:read + pull-requests:write
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Baseline (read-only)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          echo "== PR1 state =="; gh api repos/$R/pulls/1 --jq '{state,merged,base:.base.ref,head:.head.sha}'
+          echo "== token can write contents? (expect 403) =="
+          curl -s -o /tmp/b -w 'HTTP %{http_code}\n' -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$R/contents/probe-should-fail.txt \
+            -d '{"message":"probe","content":"eA==","branch":"feat"}'; head -c 300 /tmp/b; echo
+      - name: T1 sync merge PR1 (expect 403)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          curl -s -o /tmp/b -w 'HTTP %{http_code}\n' -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$R/pulls/1/merge -d '{"merge_method":"merge"}'; head -c 400 /tmp/b; echo
+      - name: T2 async merge PR1 (operation under test)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          curl -s -o /tmp/b -w 'HTTP %{http_code}\n' -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$R/pulls/1/merge-async -d '{"merge_method":"merge","merge_action":"direct_merge"}' | tee /tmp/code; head -c 600 /tmp/b; echo
+          UUID=$(python3 -c "import json;print(json.load(open('/tmp/b')).get('uuid') or json.load(open('/tmp/b')).get('id',''))" 2>/dev/null || true)
+          if [ -n "$UUID" ]; then for i in 1 2 3 4 5 6; do sleep 5; echo "-- poll $i --"; curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/$R/pulls/1/merge-async/$UUID | head -c 600; echo; done; fi
+          echo "== PR1 state after =="; gh api repos/$R/pulls/1 --jq '{state,merged,merged_at}'
+  control:
+    # Positive control: same token type with contents:write (expected to be able to merge)
+    needs: low
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: T3 sync merge PR1 if still open (expect 200)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          ST=$(gh api repos/$R/pulls/1 --jq '.merged'); echo "merged=$ST"
+          if [ "$ST" = "false" ]; then curl -s -o /tmp/b -w 'HTTP %{http_code}\n' -X PUT -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$R/pulls/1/merge -d '{"merge_method":"merge"}'; head -c 300 /tmp/b; echo; fi
